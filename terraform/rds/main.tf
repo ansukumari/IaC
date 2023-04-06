@@ -115,7 +115,7 @@ resource "aws_db_instance" "mysql_db_instance" {
   multi_az                     = var.multi_AZ
   storage_encrypted            = true
   storage_type                 = "gp3"
-  allocated_storage            = var.storage
+  allocated_storage            = 50
   max_allocated_storage        = 100
   performance_insights_enabled = true
   skip_final_snapshot          = true
