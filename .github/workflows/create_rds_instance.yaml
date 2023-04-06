@@ -1,0 +1,119 @@
+name: "RDS Instance"
+on:
+  workflow_dispatch: 
+    inputs: 
+      db_name: 
+        description: "Provide the RDS instance name (should be less than 15 chars)"
+        required: true
+      environment: 
+        type: choice
+        default: staging
+        description: "Provide the environment resource"
+        required: true
+        options: 
+        - staging
+        - production
+        - systems-prd
+        - load-test
+      command: 
+        type: choice
+        default: Create
+        options: 
+        - Create
+        - Destroy        
+      engine_name: 
+        default: mysql
+        description: "Provide the DB engine"
+        required: true
+      engine_version: 
+        default: 8.0
+        description: "Provide DB engine version"
+        required: true
+      instance_class: 
+        default: db.m6g.12xlarge
+        description: "Provide DB instance type"
+        required: true
+      multi_AZ: 
+        default: true
+        description: "Provide if the RDS should be multi AZ"
+        required: true
+      username: 
+        default: admin
+        description: "Provide DB login username (cannot be 3 characters or less)"
+      password: 
+        default: adminadmin
+        description: "Provide DB login username (cannot be less than 8 characters)"
+      replica_count: 
+        default: 2
+        description: "Provide number of replicas the master db should have"
+  schedule:
+     - cron: "0 0 * * *"
+
+jobs: 
+  apply:
+    name: "${{ github.event.inputs.command || 'Destroy' }} RDS"
+    runs-on: [self-hosted, linux, X64]
+    environment: ${{ github.event.inputs.environment }}
+    defaults:
+      run:
+        working-directory: terraform/rds/
+    steps:
+      - name: Send notfication on slack
+        if: always()
+        uses: ravsamhq/notify-slack-action@v1
+        with:
+          status: ${{ job.status }}
+          notification_title: "${{ github.event.inputs.command || 'Destroy' }} RDS Action triggered."
+          message_format: "*RDS* Action triggered by *${{ github.actor }}*"
+          footer: "<{run_url}|View Run> | Release Tag: ${{ github.ref_name }}"
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.DEPLOY_NOTIFICATION_SLACK }}
+
+      - name: Checkout
+        uses: actions/checkout@v2
+
+      - name: Create variables file 
+
+        run: |
+          cat <<EOF > terraform.auto.tfvars
+          db_name = "${{ github.event.inputs.db_name }}"
+          environment =  "${{ github.event.inputs.environment }}"
+          region = "${{ vars.region }}"
+          aws_access_key = "${{ secrets.AWS_ACCESS_KEY_ID }}"
+          aws_access_key_id = "${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+          vpc_id = "${{ vars.vpc_id }}" 
+          engine_name =  "${{ github.event.inputs.engine_name }}"
+          engine_version =  "${{ github.event.inputs.engine_version }}"
+          instance_class =  "${{ github.event.inputs.instance_class }}"
+          multi_AZ =  ${{ github.event.inputs.multi_AZ }}
+          username =  "${{ github.event.inputs.username }}"
+          password =  "${{ github.event.inputs.password }}"
+          replica_count =  "${{ github.event.inputs.replica_count }}"
+          replica_instance =  "${{ github.event.inputs.replica_instance }}"
+          replica_multiAZ =  ${{ github.event.inputs.replica_multiAZ }}
+          
+          EOF
+
+          cat terraform.auto.tfvars
+    
+      - name: Terraform Init
+        run: terraform init -input=false
+        
+      - name: Terraform Apply
+        if: github.event.inputs.command == 'Create'
+        run: terraform apply -auto-approve
+      
+      - name: Terraform Destroy
+        if: github.event.inputs.command != 'Create'
+        run: terraform destroy -auto-approve
+      
+      - name: Report Status
+        if: always()
+        uses: ravsamhq/notify-slack-action@v1
+        with:
+          status: ${{ job.status }}
+          notification_title: ""
+          footer: "<{run_url}|View Run>"
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.DEPLOY_NOTIFICATION_SLACK }}
+    
