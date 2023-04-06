@@ -1,4 +1,4 @@
-name: "RDS Instance"
+name: "Create RDS Instance"
 on:
   workflow_dispatch: 
     inputs: 
@@ -46,8 +46,8 @@ on:
       replica_count: 
         default: 2
         description: "Provide number of replicas the master db should have"
-  schedule:
-     - cron: "0 0 * * *"
+#   schedule: # Optionally, schedule destroying with cron
+#      - cron: "0 0 * * *"
 
 jobs: 
   apply:
