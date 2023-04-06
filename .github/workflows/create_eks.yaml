@@ -1,0 +1,209 @@
+name: "Create EKS"
+on:
+  workflow_dispatch: 
+    inputs: 
+      cluster_name: 
+        description: "Provide the cluster name."
+        required: true
+      environment: 
+        type: choice
+        default: staging
+        description: "Provide the environment resource"
+        required: true
+        options: 
+        - staging
+        - production
+        - systems-prd
+        - load-test
+      subnet1_cidr:
+        description: "Provide the CIDR block for the first subnet."
+        required: true
+      subnet2_cidr:
+        description: "Provide the CIDR block for second subnet."
+        required: true
+      subnet_size:
+        default: "/24"
+        description: "Provide the size of each of the subnet."
+
+
+jobs:
+  createCluster:
+    name: "Create K8s Cluster"
+    runs-on: [self-hosted, linux, X64]
+    environment: ${{ github.event.inputs.environment }}
+    steps:
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v1
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{vars.AWS_REGION}}
+
+    - name: Create subnet 1a
+      id: subnet1a
+      run: |
+        subnet_id=$(
+          aws ec2 create-subnet \
+          --vpc-id ${{vars.VPC_ID}} \
+          --cidr-block ${{ github.event.inputs.subnet1_cidr }}${{ github.event.inputs.subnet_size }} \
+          --availability-zone ${{vars.AWS_REGION}}a | jq '.Subnet.SubnetId' )
+        echo "subnetId1a=$subnet_id" >> $GITHUB_ENV
+
+    - name: Create subnet 1b
+      id: subnet1b
+      run: |
+        subnet_id=$(
+          aws ec2 create-subnet \
+          --vpc-id ${{vars.VPC_ID}} \
+          --cidr-block ${{ github.event.inputs.subnet2_cidr }}${{ github.event.inputs.subnet_size }} \
+          --availability-zone ${{vars.AWS_REGION}}b | jq '.Subnet.SubnetId' )
+        echo "subnetId1b=$subnet_id" >> $GITHUB_ENV
+
+    - name: Create subnet tag
+      run: |
+        aws ec2 create-tags \
+        --resources ${{env.subnetId1b}} \
+        --tags Key=Name,Value=${{ github.event.inputs.cluster_name }}-eks-private-subnet-1b Key=kubernetes.io/role/internal-elb,Value=1
+        aws ec2 create-tags \
+        --resources ${{env.subnetId1a}} \
+        --tags Key=Name,Value=${{ github.event.inputs.cluster_name }}-eks-private-subnet-1a Key=kubernetes.io/role/internal-elb,Value=1
+
+    - name: "Attach private route table to subnets"
+      run: |
+        aws ec2 associate-route-table --route-table-id ${{vars.PRIVATE_ROUTE_TABLE_ID}} --subnet-id ${{env.subnetId1a}}
+        aws ec2 associate-route-table --route-table-id ${{vars.PRIVATE_ROUTE_TABLE_ID}} --subnet-id ${{env.subnetId1b}}
+
+    - name: "Create EKS"
+      run: |
+        eksctl create cluster \
+        --name ${{ github.event.inputs.cluster_name }} \
+        --region ${{vars.AWS_REGION}} \
+        --version 1.22 \
+        --vpc-private-subnets ${{env.subnetId1a}},${{env.subnetId1b}} \
+        --without-nodegroup
+
+    - name: "Create On Demand Node Group"
+      run: |
+        aws eks create-nodegroup \
+        --cluster-name ${{ github.event.inputs.cluster_name }} \
+        --nodegroup-name ${{ github.event.inputs.cluster_name }}-ondemand-node-group \
+        --subnets ${{env.subnetId1a}} ${{env.subnetId1b}} \
+        --instance-types t4g.large \
+        --ami-type AL2_ARM_64 \
+        --capacity-type ON_DEMAND \
+        --node-role ${{vars.NODE_GROUP_ROLE}}
+
+    - name: "Create Spot node group"
+      run: |
+        aws eks create-nodegroup \
+        --cluster-name ${{ github.event.inputs.cluster_name }} \
+        --nodegroup-name ${{ github.event.inputs.cluster_name }}-spot-node-group \
+        --subnets ${{env.subnetId1a}} ${{env.subnetId1b}} \
+        --instance-types t4g.large m6g.large m6gd.large c6g.large c6gd.large \
+        --labels intent=apps \
+        --taints key=spotInstance,value=True,effect=PREFER_NO_SCHEDULE \
+        --tags k8s.io/cluster-autoscaler/node-template/taint/spotInstance=true:PreferNoSchedule,k8s.io/cluster-autoscaler/node-template/label/intent=apps \
+        --ami-type AL2_ARM_64 \
+        --capacity-type SPOT \
+        --node-role ${{vars.NODE_GROUP_ROLE}}
+
+    - name: "Create IAM OIDC provider"
+      run: |
+        eksctl utils associate-iam-oidc-provider \
+        --region ${{vars.AWS_REGION}} \
+        --cluster ${{ github.event.inputs.cluster_name }} \
+        --approve
+
+    - name: "Create IAM Service Account"
+      run: |
+        eksctl create iamserviceaccount \
+        --cluster=${{ github.event.inputs.cluster_name }} \
+        --namespace=kube-system \
+        --name=aws-load-balancer-controller \
+        --attach-policy-arn=arn:aws:iam::${{ secrets.ACCOUNT_ID }}:policy/AWSLoadBalancerControllerIAMPolicy \
+        --override-existing-serviceaccounts \
+        --approve
+
+  configure:
+    name: "Configure LB and scaling"
+    runs-on: [self-hosted, linux, X64]
+    needs: createCluster
+    environment: ${{ github.event.inputs.environment }}
+    steps:
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v1
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{vars.AWS_REGION}}
+
+    - name: "Install Load Balancer Controller"
+      run: |
+        helm repo add eks https://aws.github.io/eks-charts
+        helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
+        -n kube-system \
+        --set clusterName=${{ github.event.inputs.cluster_name }} \
+        --set serviceAccount.create=false \
+        --set serviceAccount.name=aws-load-balancer-controller 
+
+    - name: "Install Nginx Controller"
+      run: |
+        kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.3.0/deploy/static/provider/aws/deploy.yaml
+
+    - name: "Install metrics server for HPA"
+      run: |
+        kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+
+    - name: "Install Cluster Autoscaler"
+      run: |
+        kubectl apply -f https://raw.githubusercontent.com/kubernetes/autoscaler/master/cluster-autoscaler/cloudprovider/aws/examples/cluster-autoscaler-autodiscover.yaml
+        kubectl get deploy cluster-autoscaler -n kube-system -o yaml | sed -e "s/<YOUR/${{ github.event.inputs.cluster_name }}/" -e "s/CLUSTER NAME>//" | kubectl replace -f -
+
+    - name: "Create priority class for placeholder pods"
+      run: |
+        kubectl create priorityclass placeholder-priority --value=-1
+
+  # status:
+  #   name: "Check installed pod status"
+  #   runs-on: [self-hosted, linux, X64]
+  #   needs: configure
+  #   environment: ${{ github.event.inputs.environment }}
+  #   steps:
+  #   - name: Configure AWS credentials
+  #     uses: aws-actions/configure-aws-credentials@v1
+  #     with:
+  #       aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  #       aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  #       aws-region: ${{vars.AWS_REGION}}
+
+  #   - name: "Check Load Balancer Controller"
+  #     run: |
+  #       kubectl get deployment -n kube-system aws-load-balancer-controller
+
+  #   - name: "Check Nginx Controller"
+  #     run: |
+  #       kubectl get deployment -n ingress-nginx ingress-nginx-controller
+
+  #   - name: "Check metrics server"
+  #     run: |
+  #       kubectl get deployment -n kube-system metrics-server
+
+  #   - name: "Check Cluster Autoscaler"
+  #     run: |
+  #       kubectl get deployment -n kube-system cluster-autoscaler
+
+  # destroy:
+  #   name: "Destroy the eks"
+  #   runs-on: [self-hosted, linux, X64]
+  #   environment: destroy-eks-approval
+  #   steps:
+  #   - name: Configure AWS credentials
+  #     uses: aws-actions/configure-aws-credentials@v1
+  #     with:
+  #       aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  #       aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  #       aws-region: ${{vars.AWS_REGION}}
+
+  #   - name: "Delete eks"
+  #     run: |
+  #       eksctl delete cluster --region=${{vars.AWS_REGION}} --name=${{ github.event.inputs.cluster_name }}
