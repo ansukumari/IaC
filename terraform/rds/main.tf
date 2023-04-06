@@ -5,7 +5,13 @@ terraform {
       version = "~> 4.16"
     }
   }
-
+  
+  backend "s3" {
+    bucket = "terraform"
+    key    = "rds-state/"
+    region = var.region 
+  }
+  
   required_version = ">= 1.2.0"
 }
 
