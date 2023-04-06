@@ -1,4 +1,4 @@
-name: "Create EKS Cluster"
+name: "EKS Cluster"
 on:
   workflow_dispatch: 
     inputs: 
