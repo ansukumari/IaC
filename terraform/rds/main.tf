@@ -21,20 +21,24 @@ provider "aws" {
   secret_key = var.aws_access_key_id
 }
 
-data "aws_vpcs" "vpc" {
-  tags = {
-    Environment = var.environment
-  }
-}
+# data "aws_vpcs" "vpc" {
+#   tags = {
+#     Environment = var.environment
+#   }
+# }
+
+# data "aws_vpc" "selected_vpc" {
+#   id = data.aws_vpcs.vpc.ids[0]
+# }
 
 data "aws_vpc" "selected_vpc" {
-  id = data.aws_vpcs.vpc.ids[0]
+  id = var.vpc_id
 }
 
 data "aws_subnets" "private_subnets" {
   filter {
     name   = "vpc-id"
-    values = data.aws_vpcs.vpc.ids
+    values = [data.aws_vpc.selected_vpc.id]
   }
 
   tags = {
@@ -47,7 +51,7 @@ data "aws_security_group" "vpc_ssh_sg" {
   tags = {
     Purpose = "vpc-ssh"
   }
-  vpc_id = data.aws_vpcs.vpc.ids[0]
+  vpc_id = data.aws_vpc.selected_vpc.id
 
 }
 
@@ -55,7 +59,7 @@ data "aws_security_group" "vpc_ssh_sg" {
 resource "aws_security_group" "rds-sg" {
   name        = "${var.db_name}-rds-sg"
   description = "Allow RDS inbound traffic"
-  vpc_id      = data.aws_vpcs.vpc.ids[0]
+  vpc_id      = data.aws_vpc.selected_vpc.id
   ingress {
     from_port   = 3306
     to_port     = 3306
